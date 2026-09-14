@@ -1,0 +1,8 @@
+# Local secrets & generated configuration (never commit)
+.env
+firmware/.env
+firmware/src/build_config.h
+
+# PlatformIO / IDE build artifacts
+.pio/
+.vscode/
