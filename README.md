@@ -4,6 +4,12 @@ Open-source ESP8266 biometric attendance terminal hardware and firmware.
 
 This repository contains the device firmware, local configuration template, and enclosure assembly documentation. Production services, deployment configuration, databases, and administrative controls are maintained separately.
 
+> This is a **sanitized snapshot** published from the private production
+> monorepo. Firmware fixes must be made upstream and mirrored here; pinout,
+> offline buffering, enrollment, and OLED behavior are otherwise identical.
+> Note: the local configuration template points its sync URL at
+> `/api/v1/device/sync-status`; use your service's heartbeat/sync endpoint.
+
 ## Build firmware
 
 1. Install PlatformIO Core.
