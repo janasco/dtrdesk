@@ -5,10 +5,13 @@ Open-source ESP8266 biometric attendance terminal hardware and firmware.
 This repository contains the device firmware, local configuration template, and enclosure assembly documentation. Production services, deployment configuration, databases, and administrative controls are maintained separately.
 
 > This is a **sanitized snapshot** published from the private production
-> monorepo. Firmware fixes must be made upstream and mirrored here; pinout,
-> offline buffering, enrollment, and OLED behavior are otherwise identical.
-> Note: the local configuration template points its sync URL at
-> `/api/v1/device/sync-status`; use your service's heartbeat/sync endpoint.
+> monorepo. Firmware fixes are made upstream and mirrored here; pinout, offline
+> buffering, enrollment, NTP clock, and OLED behavior are otherwise identical.
+>
+> **Intentional differences from the production image:** this reference build
+> uses compile-time Wi-Fi credentials (no captive portal) and has no
+> gateway self-provisioning / claim flow. Credentials and service URLs come from
+> `firmware/.env`, which is compiled into `src/build_config.h` — never commit it.
 
 ## Build firmware
 

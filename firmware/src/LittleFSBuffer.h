@@ -10,11 +10,18 @@
 #define BUFFER_FILE_PATH "/offline_buffer.txt"
 #define TEMP_FILE_PATH   "/offline_temp.txt"
 
+// Ring-buffer caps. The offline queue must never grow without bound on a
+// flash-constrained device: once either cap is hit the OLDEST record is
+// discarded to make room for the newest scan.
+#define MAX_BUFFER_RECORDS 200
+#define MAX_BUFFER_BYTES   16384
+
 class LittleFSBuffer {
 public:
     struct OfflineLog {
         int slotId;
         unsigned long timestamp;
+        unsigned long createdAtMs; // monotonic save time; used to back-date held records
     };
 
     static void begin() {
@@ -26,8 +33,14 @@ public:
         Serial.println(F("[LittleFS] File system mounted successfully."));
     }
 
-    // Save failed log scan line to buffer file
+    // Save failed log scan line to buffer file. Bounded: if the queue is full
+    // the oldest record is dropped first so memory/flash use stays capped.
     static bool saveLog(int slotId, unsigned long timestamp) {
+        if (isFull()) {
+            Serial.println(F("[LittleFS] Buffer full; dropping oldest record to stay bounded."));
+            dropOldest();
+        }
+
         File file = LittleFS.open(BUFFER_FILE_PATH, "a");
         if (!file) {
             Serial.println(F("[LittleFS] Error opening buffer file for append!"));
@@ -73,6 +86,7 @@ public:
             OfflineLog logItem;
             logItem.slotId = doc["slot_id"] | -1;
             logItem.timestamp = doc["raw_ts"] | 0UL;
+            logItem.createdAtMs = doc["created"] | 0UL;
             if (logItem.slotId > 0) pendingLogs.push_back(logItem);
         }
 
@@ -99,8 +113,64 @@ public:
         return count;
     }
 
+    // Public pending-record accessor used by telemetry.
+    static int count() {
+        return getPendingCount();
+    }
+
+    // True once either the record cap or the byte cap has been reached.
+    static bool isFull() {
+        return getPendingCount() >= MAX_BUFFER_RECORDS || bufferBytes() >= MAX_BUFFER_BYTES;
+    }
+
+    // Total size of the on-flash buffer file, in bytes.
+    static size_t bufferBytes() {
+        if (!LittleFS.exists(BUFFER_FILE_PATH)) return 0;
+        File file = LittleFS.open(BUFFER_FILE_PATH, "r");
+        if (!file) return 0;
+        size_t size = file.size();
+        file.close();
+        return size;
+    }
+
+    // Rewrite the buffer without its oldest valid record (atomic temp+rename).
+    static void dropOldest() {
+        if (!LittleFS.exists(BUFFER_FILE_PATH)) return;
+
+        File readFile = LittleFS.open(BUFFER_FILE_PATH, "r");
+        if (!readFile) return;
+
+        File tempFile = LittleFS.open(TEMP_FILE_PATH, "w");
+        if (!tempFile) {
+            readFile.close();
+            return;
+        }
+
+        bool dropped = false;
+        while (readFile.available()) {
+            String line = readFile.readStringUntil('\n');
+            line.trim();
+            if (line.length() < 5) continue;
+            if (!dropped) {
+                dropped = true; // size cap: drop the single oldest record
+                continue;
+            }
+            tempFile.println(line);
+        }
+
+        readFile.close();
+        tempFile.close();
+
+        LittleFS.remove(BUFFER_FILE_PATH);
+        if (dropped) {
+            LittleFS.rename(TEMP_FILE_PATH, BUFFER_FILE_PATH);
+        } else {
+            LittleFS.remove(TEMP_FILE_PATH);
+        }
+    }
+
     // Flush offline buffer line by line via callback handler
-    typedef std::function<bool(int slotId, unsigned long timestamp)> FlushCallback;
+    typedef std::function<bool(const OfflineLog&)> FlushCallback;
 
     static void flushBuffer(FlushCallback sendFunc) {
         if (!LittleFS.exists(BUFFER_FILE_PATH)) return;
@@ -131,20 +201,23 @@ public:
             DeserializationError err = deserializeJson(doc, line);
             if (err) continue;
 
-            int slotId = doc["slot_id"];
-            unsigned long rawTs = doc["raw_ts"];
+            OfflineLog logItem;
+            logItem.slotId = doc["slot_id"] | -1;
+            logItem.timestamp = doc["raw_ts"] | 0UL;
+            logItem.createdAtMs = doc["created"] | 0UL;
+            if (logItem.slotId <= 0) continue;
 
             // Attempt cloud push
-            bool sent = sendFunc(slotId, rawTs);
+            bool sent = sendFunc(logItem);
 
             if (sent) {
                 successCount++;
-                Serial.printf("[LittleFS] Successfully flushed offline slot #%d to Cloud.\n", slotId);
+                Serial.printf("[LittleFS] Successfully flushed offline slot #%d to Cloud.\n", logItem.slotId);
             } else {
                 // Keep failed record in temp file to retry later
                 tempFile.println(line);
                 failCount++;
-                Serial.printf("[LittleFS] Flush failed for slot #%d. Keeping in buffer.\n", slotId);
+                Serial.printf("[LittleFS] Flush failed for slot #%d. Keeping in buffer.\n", logItem.slotId);
             }
         }
 
