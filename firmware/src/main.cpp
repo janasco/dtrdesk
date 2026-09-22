@@ -105,6 +105,10 @@ String sensorFaultReason;
 bool deviceRevoked = false;
 bool revocationHandled = false;
 
+// Last heartbeat outcome, surfaced by the serial self-test (`selftest`).
+bool lastHeartbeatOk = false;
+bool lastHeartbeatAttempted = false;
+
 // Function Prototypes
 void setupWiFi();
 void triggerFeedback(bool success, int beepCount = 1);
@@ -116,6 +120,7 @@ bool enrollFingerprint(int slotId, const char* fingerName = "");
 void persistSensorFault(bool faulted, const String& reason);
 void loadSensorFault();
 void handleRevocation();
+void printDiagnostics();
 
 void setup() {
     Serial.begin(115200);
@@ -179,10 +184,19 @@ void setup() {
     } else {
         updateOledStatus("DTRDesk.com", "READY FOR SCAN", "Place Finger...");
     }
+    printDiagnostics();
 }
 
 void loop() {
     unsigned long currentMillis = millis();
+
+    // Serial self-test: type `selftest` (or `diag`) and press Enter.
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        cmd.toLowerCase();
+        if (cmd == "selftest" || cmd == "diag") printDiagnostics();
+    }
 
     // 0. A revoked/rotated key is permanent: stop all cloud work and retrying.
     if (deviceRevoked) {
@@ -573,6 +587,8 @@ bool transmitBiometricLog(int slotId, unsigned long timestamp, bool isOfflineBuf
  */
 void checkHeartbeat() {
     if (WiFi.status() != WL_CONNECTED) return;
+    lastHeartbeatAttempted = true;
+    lastHeartbeatOk = false;
 
     WiFiClientSecure client;
     configureTls(client);
@@ -602,6 +618,7 @@ void checkHeartbeat() {
         Serial.printf("[Heartbeat] HTTP %d - device key rejected (revoked/rotated).\n", httpCode);
         deviceRevoked = true;
     } else if (httpCode == 200) {
+        lastHeartbeatOk = true;
         String resp = http.getString();
         StaticJsonDocument<384> respDoc;
         DeserializationError err = deserializeJson(respDoc, resp);
@@ -641,4 +658,33 @@ void checkHeartbeat() {
         Serial.println(F("[Heartbeat] Telemetry sync OK."));
     }
     http.end();
+}
+
+/**
+ * Serial self-test snapshot (type `selftest` + Enter on the 115200 console).
+ * Prints one line per subsystem so a hardware failure is unambiguous; it makes
+ * no cloud calls.
+ */
+void printDiagnostics() {
+    Serial.println(F("\n---- DTRDesk self-test ----"));
+    Serial.printf("[diag] firmware      : %s\n", DTRDESK_FIRMWARE_VERSION);
+    Serial.printf("[diag] device_id     : %s\n", DTRDESK_DEVICE_ID);
+    Serial.printf("[diag] wifi          : %s  rssi=%d dBm  ip=%s\n",
+                  WiFi.status() == WL_CONNECTED ? "connected" : "offline",
+                  WiFi.RSSI(), WiFi.localIP().toString().c_str());
+    Serial.printf("[diag] clock         : %s (%lu)\n",
+                  clockValid() ? "synced" : "NOT synced", (unsigned long)time(nullptr));
+    Serial.printf("[diag] cloud         : %s\n",
+                  !lastHeartbeatAttempted ? "no heartbeat yet"
+                                          : (lastHeartbeatOk ? "heartbeat ok" : "heartbeat FAILED"));
+    Serial.printf("[diag] sensor (AS608): %s%s%s\n", sensorFaulted ? "FAULT" : "ok",
+                  (sensorFaulted && sensorFaultReason.length()) ? " - " : "",
+                  sensorFaulted ? sensorFaultReason.c_str() : "");
+    Serial.printf("[diag] oled (SSD1306): %s\n", isOledConnected ? "ok" : "NOT detected");
+    Serial.printf("[diag] offline buffer: %d record(s), %u bytes, full=%s\n",
+                  LittleFSBuffer::count(), (unsigned)LittleFSBuffer::bufferBytes(),
+                  LittleFSBuffer::isFull() ? "yes" : "no");
+    Serial.printf("[diag] lockdown      : %s\n", isLockdownActive ? "ACTIVE" : "off");
+    Serial.printf("[diag] revoked       : %s\n", deviceRevoked ? "YES - re-flash" : "no");
+    Serial.println(F("---------------------------\n"));
 }
