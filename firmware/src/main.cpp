@@ -4,14 +4,12 @@
 #include <ESP8266HTTPClient.h>
 #include <SoftwareSerial.h>
 #include <Adafruit_Fingerprint.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include <sys/time.h>
 
 #include "config.h"
+#include "Display.h"
 #include "LittleFSBuffer.h"
 #include "TrustAnchors.h"
 
@@ -83,7 +81,7 @@ static void syncClockNtp(unsigned long timeoutMs = 10000) {
 // Hardware Interfaces
 SoftwareSerial mySerial(FINGERPRINT_RX_PIN, FINGERPRINT_TX_PIN);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// The display object (SSD1306 or ST7789) lives in Display.h.
 
 // State tracking variables
 unsigned long lastScanTime = 0;
@@ -122,6 +120,20 @@ void loadSensorFault();
 void handleRevocation();
 void printDiagnostics();
 
+/**
+ * Drive a status LED. The TFT pin map wires the red LED active-low so GPIO2
+ * stays high at boot; every call site goes through here.
+ */
+static inline void ledWrite(int pin, bool on) {
+#ifdef LED_RED_ACTIVE_LOW
+    if (pin == LED_RED_PIN) {
+        digitalWrite(pin, on ? LOW : HIGH);
+        return;
+    }
+#endif
+    digitalWrite(pin, on ? HIGH : LOW);
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -134,13 +146,13 @@ void setup() {
     pinMode(LED_GREEN_PIN, OUTPUT);
     pinMode(LED_RED_PIN, OUTPUT);
     pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(LED_GREEN_PIN, LOW);
-    digitalWrite(LED_RED_PIN, LOW);
+    ledWrite(LED_GREEN_PIN, false);
+    ledWrite(LED_RED_PIN, false);
     digitalWrite(BUZZER_PIN, LOW);
 
-    // Initialize I2C Wire & OLED Display (SCL=D1, SDA=D2)
-    Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
-    if (display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS)) {
+    // Initialize the display bus + panel (OLED I2C or TFT SPI).
+    displayBusInit();
+    if (displayBegin()) {
         isOledConnected = true;
         display.clearDisplay();
         display.setTextColor(SSD1306_WHITE);
@@ -311,13 +323,54 @@ void loop() {
 }
 
 /**
- * Render Status Screen to 0.96" I2C OLED (128x64 SSD1306)
+ * Render the status screen. The OLED (128x64, text size 1) and the 2.8" TFT
+ * (320x240 landscape, large centered type) share this one entry point.
  */
 void updateOledStatus(const char* title, const char* msg1, const char* msg2, bool isSuccess, bool force) {
     if (!isOledConnected) return;
     // A sensor fault is sticky: routine READY/Wi-Fi screens must not hide it.
     // The fault screen itself (and admin states) pass force=true to draw.
     if (sensorFaulted && !force) return;
+
+#ifdef DTRDESK_DISPLAY_ST7789
+    const int W = display.width();
+    const int H = display.height();
+
+    display.fillScreen(TFT_BLACK);
+
+    // Header band (green = ok, maroon = error/attention).
+    const uint16_t headerColor = isSuccess ? TFT_DARKGREEN : TFT_MAROON;
+    display.fillRect(0, 0, W, 48, headerColor);
+    display.setTextDatum(TL_DATUM);
+    display.setTextColor(TFT_WHITE, headerColor);
+    display.setTextSize(2);
+    display.setCursor(14, 15);
+    display.print(title);
+
+    // Primary status line — the big one a user reads from a distance.
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setTextSize(3);
+    display.setCursor(14, 84);
+    display.print(msg1);
+
+    // Optional secondary line.
+    if (msg2 && strlen(msg2) > 0) {
+        display.setTextSize(2);
+        display.setCursor(14, 136);
+        display.print(msg2);
+    }
+
+    // Footer: connectivity + clock state.
+    display.fillRect(0, H - 44, W, 44, TFT_DARKGREY);
+    display.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    display.setTextSize(2);
+    display.setCursor(14, H - 32);
+    if (WiFi.status() == WL_CONNECTED) {
+        display.print(clockValid() ? F("WIFI OK | SYNCED") : F("WIFI OK | NTP WAIT"));
+    } else {
+        display.print(F("OFFLINE | BUFFER"));
+    }
+#else
     display.clearDisplay();
 
     // Top Header Bar
@@ -350,6 +403,7 @@ void updateOledStatus(const char* title, const char* msg1, const char* msg2, boo
     }
 
     display.display();
+#endif
 }
 
 /**
@@ -370,7 +424,7 @@ void setupWiFi() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        digitalWrite(LED_RED_PIN, LOW);
+        ledWrite(LED_RED_PIN, false);
         Serial.println(F("\n[WiFi] Connected successfully!"));
         Serial.print(F("[WiFi] IP Address: "));
         Serial.println(WiFi.localIP());
@@ -378,7 +432,7 @@ void setupWiFi() {
         delay(1000);
     } else {
         Serial.println(F("\n[WiFi] Connection timed out. Operating in Offline Mode."));
-        digitalWrite(LED_RED_PIN, HIGH);
+        ledWrite(LED_RED_PIN, true);
         updateOledStatus("DTRDesk.com", "Offline Mode", "Flash Buffer Active", false);
         delay(1000);
     }
@@ -431,10 +485,10 @@ void triggerFeedback(bool success, int beepCount) {
     int targetPin = success ? LED_GREEN_PIN : LED_RED_PIN;
 
     for (int i = 0; i < beepCount; i++) {
-        digitalWrite(targetPin, HIGH);
+        ledWrite(targetPin, true);
         digitalWrite(BUZZER_PIN, HIGH);
         delay(80);
-        digitalWrite(targetPin, LOW);
+        ledWrite(targetPin, false);
         digitalWrite(BUZZER_PIN, LOW);
         if (i < beepCount - 1) delay(80);
     }

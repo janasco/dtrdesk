@@ -15,14 +15,37 @@
 #define OLED_SCL_PIN          D1    // GPIO5 -> OLED SCL
 #define OLED_SDA_PIN          D2    // GPIO4 -> OLED SDA
 
-// AS608 Fingerprint Sensor Pin Definitions (SoftwareSerial)
-#define FINGERPRINT_RX_PIN    D5    // GPIO14 -> AS608 TX (ESP8266 Serial RX)
-#define FINGERPRINT_TX_PIN    D6    // GPIO12 -> AS608 RX (ESP8266 Serial TX)
+// ---------------------------------------------------------------------------
+// 2.8" ST7789 240x320 SPI TFT option (-D DTRDESK_DISPLAY_ST7789=1)
+//
+// The TFT replaces the SSD1306 and takes the hardware SPI bus, which forces the
+// rest of the terminal onto the remaining pins. A NodeMCU exposes 9 usable
+// GPIOs; the layout below uses exactly nine:
+//   TFT    SCK D5 / MOSI D7 / CS D8 / DC D1   (RST + backlight -> 3V3)
+//   AS608  RX  D2 / TX   D6
+//   LEDs   green D0 / red D4 (ACTIVE LOW, keeps GPIO2 high at boot)
+//   buzzer D3
+// Touch and the microSD slot share the same SPI bus and would need another pin
+// (drop an LED) — they are intentionally not wired.
+// ---------------------------------------------------------------------------
+#ifdef DTRDESK_DISPLAY_ST7789
+  #define FINGERPRINT_RX_PIN  D2    // GPIO4  -> AS608 TX (ESP8266 Serial RX)
+  #define FINGERPRINT_TX_PIN  D6    // GPIO12 -> AS608 RX (ESP8266 Serial TX)
 
-// Hardware Indicator Pins (NodeMCU ESP8266)
-#define LED_GREEN_PIN         D7    // GPIO13 -> Green LED (Access Granted)
-#define LED_RED_PIN           D8    // GPIO15 -> Red LED (Access Denied / Offline)
-#define BUZZER_PIN            D3    // GPIO0  -> Buzzer Feedback
+  #define LED_GREEN_PIN       D0    // GPIO16 -> Green LED (Access Granted)
+  #define LED_RED_PIN         D4    // GPIO2  -> Red LED (Access Denied / Offline)
+  #define LED_RED_ACTIVE_LOW  1     // 3V3 -> resistor -> LED -> D4 (boot-safe)
+  #define BUZZER_PIN          D3    // GPIO0  -> Buzzer Feedback
+#else
+  // AS608 Fingerprint Sensor Pin Definitions (SoftwareSerial)
+  #define FINGERPRINT_RX_PIN  D5    // GPIO14 -> AS608 TX (ESP8266 Serial RX)
+  #define FINGERPRINT_TX_PIN  D6    // GPIO12 -> AS608 RX (ESP8266 Serial TX)
+
+  // Hardware Indicator Pins (NodeMCU ESP8266)
+  #define LED_GREEN_PIN       D7    // GPIO13 -> Green LED (Access Granted)
+  #define LED_RED_PIN         D8    // GPIO15 -> Red LED (Access Denied / Offline)
+  #define BUZZER_PIN          D3    // GPIO0  -> Buzzer Feedback
+#endif
 
 // Timing & Debounce Parameters
 #define SCAN_DEBOUNCE_MS      3000   // 3 Seconds debounce between identical scans
