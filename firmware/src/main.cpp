@@ -10,16 +10,17 @@
 
 #include "config.h"
 #include "Display.h"
+#include "DeviceConfig.h"
 #include "LittleFSBuffer.h"
+#include "WiFiManager.h"
 #include "TrustAnchors.h"
 
 // Earliest sane wall-clock epoch (2024-01-01T00:00:00Z). Anything below this
-// means neither NTP nor the server epoch has been adopted yet, so scans must
-// not be stamped with a bogus 1970 timestamp.
+// means neither NTP nor the server epoch has been adopted yet.
 #define MIN_VALID_EPOCH 1704067200UL
 
 // Compile-time build epoch, used only to satisfy BearSSL's certificate date
-// check before the system clock is set. This lets the heartbeat adopt the
+// check when the system clock is not set yet. This lets the heartbeat adopt the
 // server epoch without ever disabling certificate validation.
 static time_t buildEpoch() {
     static time_t cached = 0;
@@ -87,9 +88,11 @@ Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
 unsigned long lastScanTime = 0;
 unsigned long lastHeartbeatTime = 0;
 unsigned long lastFlushTime = 0;
+unsigned long lastClaimTime = 0;
 int lastScannedSlot = -1;
 bool isOledConnected = false;
 bool isLockdownActive = false;
+DTRDeskWiFiManager wifiManager;
 
 // Sensor-fault state. Persisted so a wiring fault survives a reboot and is
 // reported to the backend until the AS608 answers again.
@@ -99,7 +102,7 @@ String sensorFaultReason;
 
 // Set when /device/logs or /device/heartbeat answers 401/403: the key was
 // revoked or rotated. Unlike a network blip this is permanent, so we stop
-// retrying and surface it for re-provisioning.
+// retrying and send the user back through the captive portal.
 bool deviceRevoked = false;
 bool revocationHandled = false;
 
@@ -108,13 +111,16 @@ bool lastHeartbeatOk = false;
 bool lastHeartbeatAttempted = false;
 
 // Function Prototypes
-void setupWiFi();
+// WiFi Manager handles connectivity
 void triggerFeedback(bool success, int beepCount = 1);
 int readFingerprintID();
 bool transmitBiometricLog(int slotId, unsigned long timestamp, bool isOfflineBuff = false);
 void checkHeartbeat();
 void updateOledStatus(const char* title, const char* msg1, const char* msg2 = "", bool isSuccess = true, bool force = false);
 bool enrollFingerprint(int slotId, const char* fingerName = "");
+void reportEnrollmentResult(int slotId, bool success, const char* finger);
+bool tryClaimGateway();
+bool tryRegisterGateway();
 void persistSensorFault(bool faulted, const String& reason);
 void loadSensorFault();
 void handleRevocation();
@@ -140,7 +146,6 @@ void setup() {
     Serial.println(F("\n=============================================="));
     Serial.println(F("    DTRDesk.com ESP8266 Biometric Firmware   "));
     Serial.println(F("=============================================="));
-    Serial.printf("[Build] Firmware version %s\n", DTRDESK_FIRMWARE_VERSION);
 
     // Initialize Pin Modes
     pinMode(LED_GREEN_PIN, OUTPUT);
@@ -162,18 +167,25 @@ void setup() {
         Serial.println(F("[OLED] Warning: 0.96\" SSD1306 OLED display not found on I2C (0x3C)."));
     }
 
-    // Mount LittleFS Flash File System
+    // Mount LittleFS Flash File System, then load runtime device credentials
     LittleFSBuffer::begin();
-    // Restore a persisted sensor fault before we decide the device is healthy.
-    loadSensorFault();
+    DeviceConfig::begin();
+    Serial.printf("[Device] id=%s provisioned=%s usable_key=%s\n",
+                  DeviceConfig::deviceId().c_str(),
+                  DeviceConfig::isProvisioned() ? "yes" : "no",
+                  DeviceConfig::hasUsableKey() ? "yes" : "no");
 
     // Initialize Fingerprint Sensor
+    loadSensorFault();
     finger.begin(57600);
-    if (finger.verifyPassword() && !sensorFaulted) {
+    if (finger.verifyPassword()) {
         Serial.println(F("[Hardware] AS608 Fingerprint Sensor Detected Successfully!"));
-        sensorFaulted = false;
-        sensorFaultReason = "";
-        persistSensorFault(false, "");
+        if (sensorFaulted) {
+            Serial.println(F("[Hardware] Sensor recovered; clearing persisted fault."));
+            sensorFaulted = false;
+            sensorFaultReason = "";
+            persistSensorFault(false, "");
+        }
         updateOledStatus("DTRDesk.com", "AS608 Sensor", "Ready Status: OK");
         triggerFeedback(true, 2); // Double beep hardware startup
     } else {
@@ -181,25 +193,51 @@ void setup() {
         sensorFaulted = true;
         sensorFaultReason = "AS608 fingerprint sensor not detected";
         persistSensorFault(true, sensorFaultReason);
-        updateOledStatus("SENSOR FAULT", "AS608 missing", "Check wiring", false, true);
+        updateOledStatus("DTRDesk.com", "Sensor Error!", "AS608 Disconnected", false, true);
         triggerFeedback(false, 3);
     }
 
-    // Connect to Wi-Fi, then set the wall clock (needed for TLS + timestamps).
-    setupWiFi();
-    if (WiFi.status() == WL_CONNECTED) {
+    // Initialize WiFi Manager (Auto-connect or AP mode)
+    wifiManager.begin();
+    if (wifiManager.isAPMode()) {
+        String apSsidLine = "SSID " + wifiManager.getAPSSID();
+        String apPassLine = "Pass " + wifiManager.getAPPassword();
+        Serial.printf("[WiFi] AP Mode Active - Connect to: %s\n", wifiManager.getAPSSID().c_str());
+        Serial.printf("[WiFi] Password: %s\n", wifiManager.getAPPassword().c_str());
+        Serial.printf("[WiFi] Setup URL: http://%s\n", wifiManager.getIP().c_str());
+        updateOledStatus("WiFi Setup Mode", apSsidLine.c_str(), apPassLine.c_str());
+        // Keep the sensor fault visible even through setup, so a broken sensor
+        // is not silently masked by the Wi-Fi provisioning screen.
+        if (sensorFaulted) {
+            updateOledStatus("SENSOR ERROR", apSsidLine.c_str(), apPassLine.c_str(), false, true);
+        }
+        ledWrite(LED_RED_PIN, true);
+    } else {
+        ledWrite(LED_RED_PIN, false);
+        updateOledStatus("DTRDesk.com", "WiFi Connected!", wifiManager.getIP().c_str());
+        delay(1000);
+    }
+
+    // Real wall-clock time is required for both TLS date validation and
+    // attendance timestamps; sync via NTP as soon as Wi-Fi is up.
+    if (!wifiManager.isAPMode()) {
         syncClockNtp();
     }
 
-    if (sensorFaulted) {
-        updateOledStatus("SENSOR FAULT", "AS608 missing", "Check wiring", false, true);
-    } else {
-        updateOledStatus("DTRDesk.com", "READY FOR SCAN", "Place Finger...");
+    // A gateway flashed from the org portal arrives with either staged org login
+    // (primary) or a claim code; exchange it for credentials once Wi-Fi is up.
+    if (!wifiManager.isAPMode() &&
+        (DeviceConfig::hasPendingRegistration() || DeviceConfig::pendingClaim().length() > 0)) {
+        if (!tryRegisterGateway()) tryClaimGateway();
     }
+
+    updateOledStatus("DTRDesk.com", "READY FOR SCAN", "Place Finger...");
     printDiagnostics();
 }
 
 void loop() {
+    // Handle captive portal requests in AP mode
+    wifiManager.handleClient();
     unsigned long currentMillis = millis();
 
     // Serial self-test: type `selftest` (or `diag`) and press Enter.
@@ -210,14 +248,15 @@ void loop() {
         if (cmd == "selftest" || cmd == "diag") printDiagnostics();
     }
 
-    // 0. A revoked/rotated key is permanent: stop all cloud work and retrying.
+    // 0. A revoked/rotated key is permanent: stop all cloud work and retrying,
+    //    surface it on the OLED and reopen the setup portal for re-provisioning.
     if (deviceRevoked) {
         handleRevocation();
         return;
     }
 
     // 1. Maintain Wi-Fi Connection
-    if (WiFi.status() != WL_CONNECTED && currentMillis % 10000 < 50) {
+    if (!wifiManager.isAPMode() && WiFi.status() != WL_CONNECTED && currentMillis % 10000 < 50) {
         Serial.println(F("[WiFi] Reconnecting to network..."));
         WiFi.reconnect();
     }
@@ -309,7 +348,8 @@ void loop() {
         }
     }
 
-    // A rejected key is permanent; stop the rest of this cycle's cloud work.
+    // A rejected key is permanent; stop the rest of this cycle's cloud work
+    // (heartbeat/claim) and re-provision.
     if (deviceRevoked) {
         handleRevocation();
         return;
@@ -319,6 +359,14 @@ void loop() {
     if (currentMillis - lastHeartbeatTime > HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatTime = currentMillis;
         checkHeartbeat();
+    }
+
+    // 5. Retry a pending gateway claim while one is staged (Every 30s)
+    if (!wifiManager.isAPMode() &&
+        (DeviceConfig::hasPendingRegistration() || DeviceConfig::pendingClaim().length() > 0) &&
+        WiFi.status() == WL_CONNECTED && currentMillis - lastClaimTime > 30000) {
+        lastClaimTime = currentMillis;
+        if (!tryRegisterGateway()) tryClaimGateway();
     }
 }
 
@@ -360,7 +408,7 @@ void updateOledStatus(const char* title, const char* msg1, const char* msg2, boo
         display.print(msg2);
     }
 
-    // Footer: connectivity + clock state.
+    // Footer: connectivity + device identity.
     display.fillRect(0, H - 44, W, 44, TFT_DARKGREY);
     display.setTextColor(TFT_WHITE, TFT_DARKGREY);
     display.setTextSize(2);
@@ -397,7 +445,7 @@ void updateOledStatus(const char* title, const char* msg1, const char* msg2, boo
     display.setCursor(4, 55);
     display.setTextSize(1);
     if (WiFi.status() == WL_CONNECTED) {
-        display.print(clockValid() ? F("WIFI OK | SYNCED") : F("WIFI OK | NTP WAIT"));
+        display.print(DeviceConfig::hasUsableKey() ? F("WIFI OK | REGISTERED") : F("WIFI OK | UNCLAIMED"));
     } else {
         display.print(F("OFFLINE | FLASH BUFFER"));
     }
@@ -407,36 +455,8 @@ void updateOledStatus(const char* title, const char* msg1, const char* msg2, boo
 }
 
 /**
- * Setup and Connect Wi-Fi from the compile-time credentials in build_config.h.
+ * WiFi is now managed by WiFiManager (captive portal)
  */
-void setupWiFi() {
-    Serial.printf("\n[WiFi] Connecting to %s...\n", WIFI_SSID);
-    updateOledStatus("DTRDesk.com", "Connecting WiFi...", WIFI_SSID);
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(F("."));
-        attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        ledWrite(LED_RED_PIN, false);
-        Serial.println(F("\n[WiFi] Connected successfully!"));
-        Serial.print(F("[WiFi] IP Address: "));
-        Serial.println(WiFi.localIP());
-        updateOledStatus("DTRDesk.com", "WiFi Connected!", WiFi.localIP().toString().c_str());
-        delay(1000);
-    } else {
-        Serial.println(F("\n[WiFi] Connection timed out. Operating in Offline Mode."));
-        ledWrite(LED_RED_PIN, true);
-        updateOledStatus("DTRDesk.com", "Offline Mode", "Flash Buffer Active", false);
-        delay(1000);
-    }
-}
 
 /**
  * Persist/restore the AS608 fault so telemetry keeps reporting it across reboots.
@@ -468,14 +488,18 @@ void loadSensorFault() {
 
 /**
  * A 401/403 from the API is permanent (revoked key / rotated key). Stop cloud
- * work and surface it; the device must be re-flashed with valid credentials.
+ * work, show it clearly, and reopen the captive portal for re-provisioning.
  */
 void handleRevocation() {
     if (revocationHandled) return;
     revocationHandled = true;
-    Serial.println(F("[Auth] Device key rejected (401/403). Re-flash required."));
+    Serial.println(F("[Auth] Device key rejected (401/403). Re-provision required."));
     triggerFeedback(false, 3);
-    updateOledStatus("REVOKED", "Key rejected", "Re-flash device", false, true);
+    wifiManager.openSetupPortal();
+    // Show how to reach the portal so the device can actually be re-provisioned.
+    String apSsidLine = "SSID " + wifiManager.getAPSSID();
+    String apPassLine = "Pass " + wifiManager.getAPPassword();
+    updateOledStatus("REVOKED", apSsidLine.c_str(), apPassLine.c_str(), false, true);
 }
 
 /**
@@ -591,8 +615,141 @@ bool enrollFingerprint(int slotId, const char* fingerName) {
 }
 
 /**
- * Post Biometric Scan Payload to the service (POST /api/v1/device/logs).
- * Never sends a placeholder timestamp; HTTPS with certificate validation.
+ * PRIMARY onboarding: register this gateway with the organization credentials
+ * entered in the captive portal (POST /api/v1/devices/register). On success the
+ * device receives its own API key and is bound to that org.
+ */
+bool tryRegisterGateway() {
+    static int regFailures = 0;
+    if (!DeviceConfig::hasPendingRegistration() || WiFi.status() != WL_CONNECTED) return false;
+
+    Serial.printf("[Register] Registering gateway with org %s...\n", DeviceConfig::regOrg().c_str());
+    updateOledStatus("REGISTERING", "Linking gateway", "to your org...");
+
+    WiFiClientSecure client;
+    configureTls(client);
+    HTTPClient http;
+    http.begin(client, DTRDESK_REGISTER_URL);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(8000);
+
+    StaticJsonDocument<384> req;
+    req["org_code"] = DeviceConfig::regOrg();
+    req["email"] = DeviceConfig::regEmail();
+    req["password"] = DeviceConfig::regPassword();
+    String location = DeviceConfig::regLocation();
+    if (location.length() > 0) req["location_name"] = location;
+    String body;
+    serializeJson(req, body);
+
+    int httpCode = http.POST(body);
+    if (httpCode == 200 || httpCode == 201) {
+        DynamicJsonDocument doc(1024);
+        DeserializationError err = deserializeJson(doc, http.getString());
+        JsonObject p = doc["provisioning"];
+        String id = p["DTRDESK_DEVICE_ID"] | "";
+        String key = p["DTRDESK_DEVICE_KEY"] | "";
+        String api = p["DTRDESK_API_URL"] | "";
+        String sync = p["DTRDESK_SYNC_URL"] | "";
+        http.end();
+        if (!err && id.length() > 0 && key.length() > 0) {
+            DeviceConfig::save(id, key, api, sync); // also clears the staged login
+            DeviceConfig::clearRegistration();
+            regFailures = 0;
+            Serial.printf("[Register] Gateway linked as %s\n", id.c_str());
+            updateOledStatus("REGISTERED", "Gateway linked", "Ready for scans", true);
+            triggerFeedback(true, 2);
+            delay(1500);
+            return true;
+        }
+        Serial.println(F("[Register] Malformed response; will retry."));
+    } else {
+        Serial.printf("[Register] HTTP %d; will retry.\n", httpCode);
+        http.end();
+        updateOledStatus("REGISTER FAILED", "Check org login", "Retrying...", false);
+        delay(1200);
+    }
+
+    if (++regFailures >= 10) {
+        regFailures = 0;
+        Serial.println(F("[Register] Too many failures; reopening setup portal."));
+        updateOledStatus("SETUP MODE", "Registration failed", "Connect: DTRDesk-Setup", false);
+        delay(1800);
+        wifiManager.openSetupPortal();
+    }
+    return false;
+}
+
+/**
+ * Exchange a staged Claim Code for this gateway's own credentials
+ * (POST /api/v1/devices/claim). Runs over HTTPS after Wi-Fi is up.
+ */
+bool tryClaimGateway() {
+    static int claimFailures = 0;
+    String code = DeviceConfig::pendingClaim();
+    if (code.length() == 0 || WiFi.status() != WL_CONNECTED) return false;
+
+    Serial.printf("[Claim] Exchanging claim code %s...\n", code.c_str());
+    updateOledStatus("CLAIMING", "Linking gateway", "to your org...");
+
+    WiFiClientSecure client;
+    configureTls(client);
+    HTTPClient http;
+    http.begin(client, DTRDESK_CLAIM_URL);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(8000);
+
+    StaticJsonDocument<128> req;
+    req["claim_code"] = code;
+    // The server binds the gateway the claim code belongs to and returns 409 if
+    // a supplied device_id differs, so never send the compile-time placeholder.
+    // Only a runtime-provisioned id (an already-claimed device) is trustworthy.
+    if (DeviceConfig::isProvisioned()) req["device_id"] = DeviceConfig::deviceId();
+    String body;
+    serializeJson(req, body);
+
+    int httpCode = http.POST(body);
+    if (httpCode == 200) {
+        DynamicJsonDocument doc(1024);
+        DeserializationError err = deserializeJson(doc, http.getString());
+        JsonObject p = doc["provisioning"];
+        String id = p["DTRDESK_DEVICE_ID"] | "";
+        String key = p["DTRDESK_DEVICE_KEY"] | "";
+        String api = p["DTRDESK_API_URL"] | "";
+        String sync = p["DTRDESK_SYNC_URL"] | "";
+        http.end();
+        if (!err && id.length() > 0 && key.length() > 0) {
+            DeviceConfig::save(id, key, api, sync); // persists without claim_code
+            DeviceConfig::clearPendingClaim();
+            claimFailures = 0;
+            Serial.printf("[Claim] Gateway linked as %s\n", id.c_str());
+            updateOledStatus("CLAIMED", "Gateway linked", "Ready for scans", true);
+            triggerFeedback(true, 2);
+            delay(1500);
+            return true;
+        }
+        Serial.println(F("[Claim] Malformed response; will retry."));
+    } else {
+        Serial.printf("[Claim] HTTP %d; will retry.\n", httpCode);
+        http.end();
+        updateOledStatus("CLAIM FAILED", "Check code & WiFi", "Retrying...", false);
+        delay(1200);
+    }
+
+    // After repeated failures (likely a wrong/expired code) re-open the setup
+    // portal so the user can enter a fresh claim code.
+    if (++claimFailures >= 10) {
+        claimFailures = 0;
+        Serial.println(F("[Claim] Too many failures; reopening setup portal."));
+        updateOledStatus("SETUP MODE", "Claim failed", "Connect: DTRDesk-Setup", false);
+        delay(1800);
+        wifiManager.openSetupPortal();
+    }
+    return false;
+}
+
+/**
+ * Post Biometric Scan Payload to Cloud API (POST /api/v1/device/logs)
  */
 bool transmitBiometricLog(int slotId, unsigned long timestamp, bool isOfflineBuff) {
     if (WiFi.status() != WL_CONNECTED) return false;
@@ -603,13 +760,17 @@ bool transmitBiometricLog(int slotId, unsigned long timestamp, bool isOfflineBuf
     configureTls(client);
     HTTPClient http;
 
-    http.begin(client, DTRDESK_API_URL);
+    String apiUrl = DeviceConfig::apiUrl();
+    String deviceId = DeviceConfig::deviceId();
+    String deviceKey = DeviceConfig::deviceKey();
+
+    http.begin(client, apiUrl);
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-DTRDesk-Device-Key", DTRDESK_DEVICE_KEY);
+    http.addHeader("X-DTRDesk-Device-Key", deviceKey);
     http.setTimeout(4000);
 
     StaticJsonDocument<256> doc;
-    doc["device_id"] = DTRDESK_DEVICE_ID;
+    doc["device_id"] = deviceId;
     doc["fingerprint_slot_id"] = slotId;
     doc["raw_timestamp"] = timestamp;
     doc["is_offline_buff"] = isOfflineBuff;
@@ -636,8 +797,39 @@ bool transmitBiometricLog(int slotId, unsigned long timestamp, bool isOfflineBuf
 }
 
 /**
- * Send Telemetry Heartbeat & Handle Remote Commands
- * (ENROLL / LOCKDOWN, plus adopting the server epoch when NTP is unavailable).
+ * Report the outcome of a remote enrollment so the server records the
+ * fingerprint only after a real, on-device success.
+ */
+void reportEnrollmentResult(int slotId, bool success, const char* finger) {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    String url = String(DTRDESK_ENROLL_RESULT_BASE) + "/" + DeviceConfig::deviceId() + "/enroll/result";
+    WiFiClientSecure client;
+    configureTls(client);
+    HTTPClient http;
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-DTRDesk-Device-Key", DeviceConfig::deviceKey());
+    http.setTimeout(8000);
+
+    StaticJsonDocument<160> doc;
+    doc["slot_id"] = slotId;
+    doc["success"] = success;
+    if (finger && strlen(finger) > 0) doc["finger"] = finger;
+    String body;
+    serializeJson(doc, body);
+
+    int httpCode = http.POST(body);
+    if (httpCode == 401 || httpCode == 403) {
+        Serial.printf("[Enroll] HTTP %d - device key rejected (revoked/rotated).\n", httpCode);
+        deviceRevoked = true;
+    }
+    Serial.printf("[Enroll] Result reported (%s): HTTP %d\n", success ? "ok" : "failed", httpCode);
+    http.end();
+}
+
+/**
+ * Send Sync Heartbeat & Check Remote Commands from Cloud (Phase 3)
  */
 void checkHeartbeat() {
     if (WiFi.status() != WL_CONNECTED) return;
@@ -648,14 +840,18 @@ void checkHeartbeat() {
     configureTls(client);
     HTTPClient http;
 
-    http.begin(client, DTRDESK_SYNC_URL);
+    String syncUrl = DeviceConfig::syncUrl();
+    String deviceId = DeviceConfig::deviceId();
+    String deviceKey = DeviceConfig::deviceKey();
+
+    http.begin(client, syncUrl);
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-DTRDesk-Device-Key", DTRDESK_DEVICE_KEY);
+    http.addHeader("X-DTRDesk-Device-Key", deviceKey);
     http.setTimeout(3000);
 
     StaticJsonDocument<384> doc;
-    doc["device_id"] = DTRDESK_DEVICE_ID;
-    doc["firmware_version"] = DTRDESK_FIRMWARE_VERSION;
+    doc["device_id"] = deviceId;
+    doc["firmware_version"] = DeviceConfig::firmwareVersion();
     doc["free_heap"] = ESP.getFreeHeap();
     doc["rssi"] = WiFi.RSSI();
     // Real pending count (not a boolean) plus an explicit overflow flag.
@@ -687,7 +883,8 @@ void checkHeartbeat() {
                 Serial.printf("[NTP] Adopted server epoch %lld\n", serverTs);
             }
             const char* mode = respDoc["mode"] | "NORMAL";
-            // Remote LOCKDOWN arrives on the same channel as ENROLL.
+            // Remote LOCKDOWN: the backend command channel is the `mode` field
+            // (same channel as ENROLL). Also accept an explicit boolean flag.
             bool lockdown = (strcmp(mode, "LOCKDOWN") == 0);
             if (!lockdown && respDoc.containsKey("lockdown")) {
                 lockdown = respDoc["lockdown"].as<bool>();
@@ -706,7 +903,8 @@ void checkHeartbeat() {
                 int targetSlot = respDoc["enroll_target_slot"] | 1;
                 String fingerLabel = respDoc["enroll_finger"] | "";
                 fingerLabel.replace("_", " ");
-                enrollFingerprint(targetSlot, fingerLabel.c_str());
+                bool enrolled = enrollFingerprint(targetSlot, fingerLabel.c_str());
+                reportEnrollmentResult(targetSlot, enrolled, fingerLabel.c_str());
             }
         }
         Serial.println(F("[Heartbeat] Telemetry sync OK."));
@@ -717,12 +915,15 @@ void checkHeartbeat() {
 /**
  * Serial self-test snapshot (type `selftest` + Enter on the 115200 console).
  * Prints one line per subsystem so a hardware failure is unambiguous; it makes
- * no cloud calls.
+ * no cloud calls. Used by HARDWARE_TEST.md.
  */
 void printDiagnostics() {
     Serial.println(F("\n---- DTRDesk self-test ----"));
-    Serial.printf("[diag] firmware      : %s\n", DTRDESK_FIRMWARE_VERSION);
-    Serial.printf("[diag] device_id     : %s\n", DTRDESK_DEVICE_ID);
+    Serial.printf("[diag] firmware      : %s\n", DeviceConfig::firmwareVersion().c_str());
+    Serial.printf("[diag] device_id     : %s\n", DeviceConfig::deviceId().c_str());
+    Serial.printf("[diag] provisioned   : %s (usable key: %s)\n",
+                  DeviceConfig::isProvisioned() ? "yes" : "no",
+                  DeviceConfig::hasUsableKey() ? "yes" : "no");
     Serial.printf("[diag] wifi          : %s  rssi=%d dBm  ip=%s\n",
                   WiFi.status() == WL_CONNECTED ? "connected" : "offline",
                   WiFi.RSSI(), WiFi.localIP().toString().c_str());
@@ -739,6 +940,6 @@ void printDiagnostics() {
                   LittleFSBuffer::count(), (unsigned)LittleFSBuffer::bufferBytes(),
                   LittleFSBuffer::isFull() ? "yes" : "no");
     Serial.printf("[diag] lockdown      : %s\n", isLockdownActive ? "ACTIVE" : "off");
-    Serial.printf("[diag] revoked       : %s\n", deviceRevoked ? "YES - re-flash" : "no");
+    Serial.printf("[diag] revoked       : %s\n", deviceRevoked ? "YES - re-provision" : "no");
     Serial.println(F("---------------------------\n"));
 }

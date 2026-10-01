@@ -7,6 +7,23 @@
 
 #include "build_config.h"
 
+// Gateway self-provisioning: a flashed device pastes a Claim Code (from the
+// org portal) into the captive portal; it is exchanged here for its own device
+// credentials. Override in build_config.h (or firmware/.env) for your service.
+#ifndef DTRDESK_CLAIM_URL
+#define DTRDESK_CLAIM_URL "https://your-service.example/api/v1/devices/claim"
+#endif
+
+// Primary onboarding: register the gateway with an org admin's credentials.
+#ifndef DTRDESK_REGISTER_URL
+#define DTRDESK_REGISTER_URL "https://your-service.example/api/v1/devices/register"
+#endif
+
+// Enrollment result callback base (POST <base>/<deviceId>/enroll/result).
+#ifndef DTRDESK_ENROLL_RESULT_BASE
+#define DTRDESK_ENROLL_RESULT_BASE "https://your-service.example/api/v1/devices"
+#endif
+
 // 0.96" I2C OLED Display Configuration (128x64 SSD1306)
 #define SCREEN_WIDTH          128
 #define SCREEN_HEIGHT         64
@@ -28,6 +45,7 @@
 // Touch and the microSD slot share the same SPI bus and would need another pin
 // (drop an LED) — they are intentionally not wired.
 // ---------------------------------------------------------------------------
+// TFT wiring/backlight notes live in firmware/README.md ("2.8\" TFT display").
 #ifdef DTRDESK_DISPLAY_ST7789
   #define FINGERPRINT_RX_PIN  D2    // GPIO4  -> AS608 TX (ESP8266 Serial RX)
   #define FINGERPRINT_TX_PIN  D6    // GPIO12 -> AS608 RX (ESP8266 Serial TX)

@@ -6,12 +6,36 @@ This repository contains the device firmware, local configuration template, and 
 
 > This is a **sanitized snapshot** published from the private production
 > monorepo. Firmware fixes are made upstream and mirrored here; pinout, offline
-> buffering, enrollment, NTP clock, and OLED behavior are otherwise identical.
+> buffering, enrollment, NTP clock, TLS validation, captive-portal provisioning
+> and OLED/TFT behavior are otherwise identical.
 >
-> **Intentional differences from the production image:** this reference build
-> uses compile-time Wi-Fi credentials (no captive portal) and has no
-> gateway self-provisioning / claim flow. Credentials and service URLs come from
-> `firmware/.env`, which is compiled into `src/build_config.h` — never commit it.
+> **Configuration:** credentials and service URLs come from `firmware/.env`,
+> which is compiled into `src/build_config.h` — never commit it. The
+> self-provisioning endpoints default to generic placeholders; set
+> `DTRDESK_CLAIM_URL` / `DTRDESK_REGISTER_URL` / `DTRDESK_ENROLL_RESULT_BASE` in
+> `.env` to point them at your own service.
+
+## Runtime device provisioning
+
+One generic binary can be flashed to many devices — no secret is baked into the
+image. Device identity (Device ID, one-time API key, API/sync URLs) is entered at
+runtime and stored in LittleFS (`/device_config.json`) by `src/DeviceConfig.h`;
+precedence is **runtime file > compile-time `build_config.h`**.
+
+On first boot (or when Wi-Fi fails / the key is rejected) the device starts the
+**`DTRDesk-Setup`** access point. The captive portal:
+
+- **scans nearby Wi-Fi** so you pick a network from a list (password only if
+  secured), auto-launches via a DNS redirect, and truncates long SSIDs;
+- links the gateway to an organization via **Org ID + admin login**
+  (`POST /devices/register`), or a **claim code** (`POST /devices/claim`) under
+  *Advanced*; both are exchanged for the device's own API key;
+- shows the AP credentials on the display: SSID `DTRDesk-Setup`, password
+  **`dtr` + the last 5 hex digits of the chip id** (e.g. `dtr1a2b3`).
+
+The device tolerates failure safely: wrong or corrupt Wi-Fi re-opens the portal,
+a claim that keeps failing re-opens it after 10 tries, and a revoked/rotated key
+stops cloud work and shows `REVOKED`.
 
 ## Build firmware
 
